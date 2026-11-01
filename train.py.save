@@ -1,0 +1,133 @@
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
+import torch.optim as optim
+import json
+import getpass
+
+# -------- CONFIG --------
+user = getpass.getuser()
+data_dir = f"/home/{user}/ad_mri_project/data/archive/AugmentedAlzheimerDataset"
+
+batch_size = 32
+epochs = 15
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("Using device:", device)
+
+# -------- DATA --------
+transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor()
+])
+
+full_dataset = datasets.ImageFolder(data_dir, transform=transform)
+
+# 🔥 TRAIN / VALIDATION SPLIT
+train_size = int(0.8 * len(full_dataset))
+val_size = len(full_dataset) - train_size
+
+train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+
+# 🔥 FAST MODE (balanced)
+train_dataset = torch.utils.data.Subset(train_dataset, range(5000))
+val_dataset = torch.utils.data.Subset(val_dataset, range(1000))
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+class_names = full_dataset.classes
+print("Classes:", class_names)
+
+# -------- MODEL --------
+base_model = models.resnet50(weights="IMAGENET1K_V1")
+modules = list(base_model.children())[:-2]
+feature_extractor = nn.Sequential(*modules)
+
+class AlzheimerModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = feature_extractor
+
+        # 🔥 NOVEL LAYER
+        self.conv1x1 = nn.Conv2d(2048, 512, kernel_size=1)
+        self.relu = nn.ReLU()
+
+        self.pool = nn.AdaptiveAvgPool2d((1,1))
+        self.fc = nn.Linear(512, 4)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.conv1x1(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+model = AlzheimerModel().to(device)
+
+# -------- LOSS --------
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+print("Starting training...")
+
+# -------- TRAIN LOOP --------
+for epoch in range(epochs):
+    print(f"\nEpoch {epoch+1} starting...")
+
+    model.train()
+    train_correct = 0
+    train_total = 0
+
+    for i, (images, labels) in enumerate(train_loader):
+
+        if i % 20 == 0:
+            print(f"Epoch {epoch+1}, Batch {i}")
+
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        _, preds = torch.max(outputs, 1)
+        train_correct += (preds == labels).sum().item()
+        train_total += labels.size(0)
+
+    train_acc = train_correct / train_total
+
+    # -------- VALIDATION --------
+    model.eval()
+    val_correct = 0
+    val_total = 0
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+            _, preds = torch.max(outputs, 1)
+
+            val_correct += (preds == labels).sum().item()
+            val_total += labels.size(0)
+
+    val_acc = val_correct / val_total
+
+    print(f"Epoch [{epoch+1}/{epochs}] Train Acc: {train_acc:.4f}  Val Acc: {val_acc:.4f}")
+
+# -------- SAVE --------
+torch.save(model.state_dict(), "alz_model.pth")
+
+with open("classes.json", "w") as f:
+    json.dump(class_names, f)
+
+print("Model saved successfully")
+
